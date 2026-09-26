@@ -1,0 +1,1133 @@
+/*
+  M5Stack CoreS3 - Stack-chan Fully Integrated System (Memory Optimized)
+  - Hopefully High Quality Noise-minimum Music Player
+  - Servo PWM Detach Noise-Reduction Control
+  - English UI Speech Bubble with 2-Second Auto-Clear Timer
+  - PortC (UART 115200bps) External ASR Module Integration
+  - Binary Packet Parser: Frame [0xAA 0x55 ID 0x55 0xAA] Integration
+  - Robust UART Communication: Half-Duplex Echo Prevention & Buffer Clearing
+  - AquesTalk Pico (CAqTkPicoF) Integration with Sync Lip-Sync
+  - ELIZA Conversation Model (Synchronized JP & Romaji Response Pairs)
+  - Strict Romaji Complete-Definition & Fallback Guard Integration
+  - Clear Return-to-Idle Triggers (10s Silence Timeout, Quit IDs, Stop Button)
+  - M5Avatar & FreeRTOS Multi-Core Architecture
+*/
+
+#include <M5Unified.h>
+#include <Avatar.h>
+#include <freertos/FreeRTOS.h>
+#include <esp_system.h>
+#include <driver/ledc.h>
+#include <SD.h>
+#include <vector>
+#include <cstdlib>
+#include <cstring>
+
+// --- ESP32 Core v3 対策 / SD Audio Playback ---
+#include <AudioGeneratorMP3.h>
+#include <AudioGeneratorWAV.h>
+#include <AudioFileSourceSD.h>
+#include <AudioOutput.h>
+// WIFIとBlurtoothを切るおまじない
+#include "WiFi.h"
+#include "esp_bt.h"
+// --- AquesTalk Pico ---
+#include "aquestalk.h"
+
+using namespace m5avatar;
+
+struct IntegratedAsrCommand;
+
+// --- コンパイルスイッチ ---
+#define ENABLE_BEEP_SOUND true 
+#define ENABLE_SERIAL_OUT true
+
+// --- サーボ制御用の設定 ---
+#define PIN_SERVO_PAN   1 
+#define PIN_SERVO_TILT  2 
+
+const int PAN_CENTER  = 74;
+const int PAN_MIN     = 39;
+const int PAN_MAX     = 109;
+
+const int TILT_CENTER = 64;
+const int TILT_MIN    = 54; 
+const int TILT_MAX    = 74; 
+
+// --- PortC (UART2) 外付けASRモジュール設定 ---
+#define PORT_C_RX 18
+#define PORT_C_TX 17
+HardwareSerial SerialPortC(2);
+
+// --- 音響・状態管理用の定義 ---
+enum RobotMode {
+  MODE_IDLE,
+  MODE_PLAYBACK,
+  MODE_ACTION
+};
+
+enum ConversationState {
+  CONV_LISTEN_WAIT,   
+  CONV_LISTEN_ACTIVE, 
+  CONV_TALK           
+};
+
+volatile RobotMode currentRobotMode = MODE_IDLE;
+volatile ConversationState currentConvState = CONV_LISTEN_WAIT;
+
+uint32_t speechTextTimeout = 0;
+uint32_t nextRandomActionTime = 0;
+uint32_t lastVoiceInputTime = 0;
+uint32_t ignoreAsrUntil = 0; 
+const uint32_t SILENCE_TIMEOUT = 10000; 
+
+std::vector<String> musicFiles;
+volatile bool isPlaying = false;
+volatile bool requestPlayNext = false; 
+uint8_t currentVolume = 125; 
+
+Avatar avatar;
+volatile float idleMouthRatio = 0.0f;
+
+static uint32_t picoWorkBuf[AQ_SIZE_WORKBUF];
+#define FRAME_LEN 256
+
+static int lastDutyPan  = -1;
+static int lastDutyTilt = -1;
+
+// =================================================================
+// --- UART バッファクリア用ヘルパー ---
+// =================================================================
+uint8_t asrPktIdx = 0; 
+
+void clearUARTBuffer() {
+  while (SerialPortC.available() > 0) {
+    SerialPortC.read();
+  }
+  asrPktIdx = 0; 
+}
+
+// =================================================================
+// --- M5Unifiedスピーカー用 高音質・プチプチノイズ防止出力クラス ---
+// =================================================================
+class AudioOutputM5Speaker : public AudioOutput {
+  private:
+    m5::Speaker_Class* _m5sound;
+    uint8_t _ch;
+    static const size_t BUF_SIZE = 256;
+    int16_t _buffer[BUF_SIZE]; 
+    size_t _bufIdx = 0;
+    int32_t _prevMono = 0;
+
+  public:
+    AudioOutputM5Speaker(m5::Speaker_Class* m5sound, uint8_t channel = 0) {
+      _m5sound = m5sound;
+      _ch = channel;
+    }
+
+    virtual bool begin() override { 
+      _bufIdx = 0;
+      _prevMono = 0;
+      return true; 
+    }
+    
+    virtual bool ConsumeSample(int16_t sample[2]) override {
+      int32_t outL = (int32_t)(sample[0] * 0.35f);
+      int32_t outR = (int32_t)(sample[1] * 0.35f);
+
+      int32_t mono = (outL + outR) / 2;
+      mono = (mono * 65 + _prevMono * 35) / 100;
+      _prevMono = mono;
+
+      if (mono > 32767)  mono = 32767;
+      if (mono < -32768) mono = -32768;
+
+      _buffer[_bufIdx++] = (int16_t)mono;
+
+      if (_bufIdx >= BUF_SIZE) {
+        uint32_t hz = (this->hertz > 0) ? this->hertz : 44100;
+        while (_m5sound->isPlaying(_ch) >= 2) {
+          esp_rom_delay_us(100);
+        }
+        _m5sound->playRaw(_buffer, _bufIdx, hz, false, 1, _ch);
+        _bufIdx = 0;
+      }
+      return true; 
+    }
+
+    virtual bool stop() override { 
+      if (_bufIdx > 0) {
+        uint32_t hz = (this->hertz > 0) ? this->hertz : 44100;
+        _m5sound->playRaw(_buffer, _bufIdx, hz, false, 1, _ch);
+        _bufIdx = 0;
+      }
+      _m5sound->stop(_ch);
+      return true; 
+    }
+};
+
+AudioGenerator *audioGen     = nullptr;
+AudioFileSourceSD *audioFile = nullptr;
+AudioOutputM5Speaker *audioOut = nullptr;
+
+// ==========================================
+// --- 統合型 ASR コマンドマップ（完全定義） ---
+// ==========================================
+struct IntegratedAsrCommand {
+  int id;                     
+  const char* raw_jp;         
+  const char* reflected_jp;   
+  const char* romaji;         
+};
+
+const IntegratedAsrCommand ASR_COMMAND_LIST[] = {
+    {1, "そんな話してない", "そんな話してない", "son'nahana'shi shite'nai"},
+    {2, "言っていない", "言っていない", "i'tteinai"},
+    {3, "違う話", "違う話", "chiga'uhanashi"},
+    {4, "何言ってるの", "何言ってるの", "na'ni i'tteruno"},
+    {5, "何言ってんだ", "何言ってんだ", "na'ni i'ttenda"},
+    {6, "わけがわからない", "わけがわからない", "wa'kega wakara'nai"},
+    {7, "意味がわからない", "意味がわからない", "i'miga wakara'nai"},
+    {8, "いや", "いや", "iya"},
+    {9, "嫌", "嫌", "iya"},
+    {10, "イヤ", "イヤ", "iya"},
+    {11, "無理", "無理", "muri"},
+    {12, "ちがう", "ちがう", "chiga'u"},
+    {13, "違う", "違う", "chiga'u"},
+    {14, "嬉しい", "嬉しい", "ure'shii"},
+    {15, "楽しい", "楽しい", "tano'shii"},
+    {16, "幸せ", "幸せ", "shiawase"},
+    {17, "最高", "最高", "saiko'o"},
+    {18, "やった", "やった", "ya'tta"},
+    {19, "成功", "成功", "seiko'o"},
+    {20, "できた", "できた", "deki'ta"},
+    {21, "悲しい", "悲しい", "kanashi'i"},
+    {22, "つらい", "つらい", "tsura'i"},
+    {23, "辛い", "辛い", "tsura'i"},
+    {24, "苦しい", "苦しい", "kuru'shii"},
+    {25, "落ち込ん", "落ち込ん", "ochikon'"},
+    {26, "不安", "不安", "huan'"},
+    {27, "心配", "心配", "shin'pai"},
+    {28, "恐い", "恐い", "kowa'i"},
+    {29, "怖い", "怖い", "kowa'i"},
+    {30, "むかつく", "むかつく", "mukatsuku"},
+    {31, "腹が立つ", "腹が立つ", "haragatatsu"},
+    {32, "イライラ", "イライラ", "iraira"},
+    {33, "怒って", "怒って", "okotte"},
+    {34, "疲れた", "疲れた", "tsukare'ta"},
+    {35, "しんどい", "しんどい", "shin'doi"},
+    {36, "限界", "限界", "gen'kai"},
+    {37, "終了", "終了", "shu'uryoo"},
+    {38, "さようなら", "さようなら", "sayo'onara"},
+    {39, "バイバイ", "バイバイ", "ba'ibai"},
+    {40, "quit", "quit", "kwi'ttu"},
+    {41, "お疲れ様", "お疲れ様", "otsukaresama"},
+    {42, "おつかれさま", "おつかれさま", "otsukaresama"},
+    // ▼ ここに挨拶を追加（IDはASRモジュールの設定に合わせる） ▼
+    {50, "こんにちは", "こんにちは", "kon'nichiwa"},
+    {51, "おはよう", "おはよう", "ohayo'o"},
+    {52, "こんばんは", "こんばんは", "kon'ban'wa"},
+    {0, "taigen", "taigen", "taigen"},
+    {99, "taigen", "taigen", "taigen"},
+    {201, "私", "あなた", "ana'ta"},
+    {202, "わたし", "あなた", "ana'ta"},
+    {203, "僕", "あなた", "ana'ta"},
+    {204, "ぼく", "あなた", "ana'ta"},
+    {205, "俺", "あなた", "ana'ta"},
+    {206, "あなた", "私", "watashi"},
+    {207, "自分の", "あなたの", "anata'no"}
+};
+const size_t ASR_COMMAND_COUNT = sizeof(ASR_COMMAND_LIST) / sizeof(ASR_COMMAND_LIST[0]);
+
+const IntegratedAsrCommand* getAsrCommand(int cmdId) {
+  for (size_t i = 0; i < ASR_COMMAND_COUNT; i++) {
+    if (ASR_COMMAND_LIST[i].id == cmdId) return &ASR_COMMAND_LIST[i];
+  }
+  return nullptr;
+}
+
+// ==========================================
+// --- ELIZA 会話モデル構造 ---
+// ==========================================
+struct Filler {
+  const char* jp;
+  const char* romaji;
+};
+
+const Filler FILLER_PREFIXES[] = {
+    {"", ""},
+    {"なるほど… ", "naru'hodo. "},// ★ "..." を "." に修正
+    {"ふむ、", "hu'mu, "},
+    {"そうですか。 ", "so'odesuka. "},
+    {"お気持ちはよく分かります。 ", "oki'mochiwa yo'ku wakari'masu. "},
+    {"ほう、", "ho'o, "}
+};
+const size_t FILLER_COUNT = sizeof(FILLER_PREFIXES) / sizeof(FILLER_PREFIXES[0]);
+
+char last_topic_jp[128] = "";
+char last_topic_romaji[128] = "";
+
+struct ResponsePair {
+  const char* jp;
+  const char* romaji;
+};
+// ★修正：weightを追加
+struct Rule {
+  int weight;
+  const char* keywords[8];
+  ResponsePair responses[4];
+  size_t response_count;
+};
+// ★修正：各ルールの先頭に優先度（重み）を追加
+const Rule PSYCHOBABBLE[] = {
+    { 80,{"そんな話", "言っていない", "違う話", "何言ってる", "何言ってんだ", "わけがわからない", "意味がわからない", NULL},
+      { {"失礼いたしました。私の聞き間違いがあったようです。もう一度詳しく教えていただけますか？",
+         "shiture'i itashimashi'ta. watashino kikimachiga'iga atta'yo'udesu. mo'uichido kuwashi'ku oshi'ete itadakema'suka?"},
+        {"申し訳ありません。会話が噛み合っていませんでしたね。本当に伝えたかったことを聞かせてください。",
+         "mo'oshiwake arimasen'. kaiwaga kamia'tte imasen'deshitane. hon'to'oni tsutaeta'katta koto'o kika'sete kuda'sai."},
+        {"大変失礼しました。どのようなことをお話ししたかったのでしょうか？",
+         "taihen' shiture'i shimashi'ta. dono'yo'ona koto'o ohanashi shita'katta no'desho'uka?"}, {NULL, NULL}}, 3 },
+    {40, {"いや", "嫌", "イヤ", "無理", "ちがう", "違う", NULL},
+      { {"何がそんなに嫌だと感じますか？", "na'niga son'nani iya'dato kanji'masuka?"},
+        {"嫌な気持ちになる理由を教えてもらえますか？", "iya'na kimo'chini naru riyu'uo oshi'ete moraema'suka?"},
+        {"無理に話さなくても大丈夫ですよ。何が気になりますか？", "muri'ni hanasa'nakutemo daijo'obudesuyo. na'niga ki'ni nari'masuka?"}, {NULL, NULL}}, 3 },
+    {60, {"嬉しい", "楽しい", "幸せ", "最高", "やった", "成功", "できた", NULL},
+      { {"それは本当に素晴らしいですね.私も自分のことのように{}気持ちになります。",
+         "sorewa hon'to'oni subarashi'idesune. watashimo jibun'no koto'no yo'uni {} kimo'chini nari'masu."},
+        {"最高ですね！あなたのその{}気持ちが伝わってきて、胸が温かくなります。",
+         "saiko'odesune. anatano sono {} kimo'chiga tsutawa'tte kite, mune'ga atatakaku nari'masu."},
+        {"それだけの素晴らしいことがあったのですから、{}と感じるのも当然ですよ！",
+         "soredakeno subarashi'i koto'ga atta'nodesukara, {} to kanji'runomo to'ojo'odesuyo!"},
+        {"おめでとうございます！その素晴らしい瞬間について、ぜひもっと詳しく聞かせてください。",
+         "omedeto'o gozaima'su.sono subarashi'i shun'kan'ni tsu'ite, zehi mo'tto kuwashi'ku kika'sete kuda'sai."}}, 4 },
+    {70, {"悲しい", "つらい", "辛い", "苦しい", "落ち込ん", NULL},
+      { {"それは本当に{}思いをされましたね。お気持ち、とてもよく分かります。",
+         "sorewa hon'to'oni {} omo'io saremashi'tane. oki'mochi, tote'mo yo'ku wakari'masu."},
+        {"そんな状態なら、{}と感じてしまうのも無理はありませんよ。",
+         "son'na jo'otainara, {} to kanji'te shima'unomo muri'wa arimasen'yo."},
+        {"一人でその{}気持ちを抱えるのは、とても大変だったのではないですか？",
+         "hitori'de sono {} kimo'chio kaka'erunowa, tote'mo taihen'datta no'deewa arimasen'ka?"},
+        {"ときに言葉にして打ち明けてくれて、ありがとうございます。",
+         "to'kini kotoba'ni shite uchiake'te kure'te, ariga'too gozaima'su."}}, 4 },
+    {70, {"不安", "心配", "恐い", "怖い", NULL},
+      { {"先が見えないと{}になってしまいますよね。あなたのその感覚はとても自然なことです。",
+         "saki'ga mie'naito {} ni na'tte shima'imasuyone. anatano sono kan'kakuwa tote'mo shizen'na koto'desu."},
+        {"それだけ大切なことだからこそ、{}に感じるのだと思います。",
+         "soredake taisetsu'na koto'dakara koso, {} ni kanji'runoda to omo'imasu."},
+        {"不安な気持ちを否定する必要はありませんよ。何が一番引っかかっていますか？",
+         "huan'na kimo'chio hitei'suru hitsuyo'owa arimasen'yo. na'niga ichiban' hikka'tte ima'suka?"}, {NULL, NULL}}, 3 },
+    {70, {"むかつく", "腹が立つ", "イライラ", "怒って", NULL},
+      { {"そんなことがあったら、{}のも当然ですよ。あなたが怒るのも無理はありません。",
+         "son'na koto'ga atta'ra, {} nomo to'ojo'odesuyo. anataga oko'runomo muri'wa arimasen'."},
+        {"強い憤りを感じるお気持ち、とても理解できます。ここで思い切り吐き出してくださいね。",
+         "tsuyo'i ikido'orio kanji'ru oki'mochi, tote'mo rikai' deki'masu. koko'de omo'ikiri hakida'shite kuda'sai."}, {NULL, NULL}, {NULL, NULL}}, 2 },
+    {50, {"疲れた", "しんどい", "限界", NULL},
+      { {"本当にお疲れのようですね。休む時間は取れていますか？",
+         "hon'to'oni otsukare'no yo'udesune. yasu'mu jikan'wa tore'te ima'suka?"},
+        {"それだけ頑張ってこられた証拠ですね。少し立ち止まって自分を労わってあげてください。",
+         "soredake gan'batte korat'ta sho'okodesune. sukoshi' tachidoma'tte jibun'o itawa'tte age'te kuda'sai."}, {NULL, NULL}, {NULL, NULL}}, 2 },
+    {90, {"こんにちは", "おはよう", "こんばんは", NULL}, // 挨拶のキーワード
+      { {"こんにちは！お話しできて嬉しいです。", "kon'nichiwa. ohanashi deki'te ure'shiidesu."},
+        {"ご挨拶ありがとうございます。何か良いことはありましたか？", "goaisatsu ariga'too gozaima'su. nani'ka yo'ikotowa arimashi'taka?"},
+        {"こんにちは。今日はどんなお話をしましょうか？", "kon'nichiwa. kyo'owa don'na ohanashio shimasho'uka?"},
+        {"お元気ですか", "ogenki'desuka."} }, 3 }, // パターン数に合わせて最後の数字を調整     
+    {100, {"終了", "さようなら", "バイバイ", "quit", "お疲れ様", "おつかれさま"},
+      { {"お話しできて良かったです。", "ohanashi deki'te yoka'ttadesu."},
+        {"さようなら。いつでもまた声をかけてくださいね。", "sayo'onara. itsudemo mata koe'o kake'te kuda'sai."},
+        {"ありがとうございました。お疲れ様でした。", "ariga'too gozaimashi'ta. otsukaresama deshi'ta."}, {NULL, NULL}}, 3 }
+};
+const size_t RULE_COUNT = sizeof(PSYCHOBABBLE) / sizeof(PSYCHOBABBLE[0]);
+
+void replacePlaceholder(const char* tmpl, const char* val, char* out, size_t maxLen) {
+  char* ph = strstr(tmpl, "{}");
+  const char* safeVal = (val != NULL && val[0] != '\0') ? val : "sore";
+
+  if (ph != NULL) {
+    size_t prefixLen = ph - tmpl;
+    strncpy(out, tmpl, prefixLen);
+    out[prefixLen] = '\0';
+    strncat(out, safeVal, maxLen - strlen(out) - 1);
+    strncat(out, ph + 2, maxLen - strlen(out) - 1);
+  } else {
+    strncpy(out, tmpl, maxLen - 1);
+    out[maxLen - 1] = '\0';
+  }
+}
+void analyze(const IntegratedAsrCommand* cmd, char* outDisplay, char* outRomaji, size_t maxLen) {
+  const char* statement = cmd->raw_jp;
+
+  // 話題リセットチェック
+  const char* clearKeys[] = {"そんな話", "言っていない", "違う話", "何言ってる", "何言ってんだ", "わけがわからない", "意味がわからない"};
+  for (size_t i = 0; i < 7; i++) {
+    if (strstr(statement, clearKeys[i]) != NULL) {
+      last_topic_jp[0] = '\0';
+      last_topic_romaji[0] = '\0';
+      break;
+    }
+  }
+
+  // ★一番重みが高いルールを探す
+  int bestRuleIdx = -1;
+  int maxWeight = -1;
+
+  for (size_t i = 0; i < RULE_COUNT; i++) {
+    for (size_t k = 0; k < 8 && PSYCHOBABBLE[i].keywords[k] != NULL; k++) {
+      if (strstr(statement, PSYCHOBABBLE[i].keywords[k]) != NULL) {
+        if (PSYCHOBABBLE[i].weight > maxWeight) {
+          maxWeight = PSYCHOBABBLE[i].weight;
+          bestRuleIdx = (int)i;
+        }
+        break; // このルールでのキーワードチェックは完了
+      }
+    }
+  }
+
+  if (bestRuleIdx != -1) {
+    int i = bestRuleIdx; 
+    
+    // ★パニックエラー対策済みの固定長配列（ルール増築用に16枠確保）
+    static int last_response_idx[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    
+    int resIdx = rand() % PSYCHOBABBLE[i].response_count;
+    
+    // 連続被り回避
+    if (resIdx == last_response_idx[i] && PSYCHOBABBLE[i].response_count > 1) {
+      resIdx = (resIdx + 1) % PSYCHOBABBLE[i].response_count;
+    }
+    last_response_idx[i] = resIdx;
+
+    ResponsePair selected = PSYCHOBABBLE[i].responses[resIdx];
+
+    // 重み(100)で終了ルールを判定（マジックナンバー i==7 の廃止）
+    bool isQuitRule = (PSYCHOBABBLE[i].weight == 100);
+
+    if (!isQuitRule && cmd->reflected_jp[0] != '\0') {
+      strncpy(last_topic_jp, cmd->reflected_jp, sizeof(last_topic_jp) - 1);
+      last_topic_jp[sizeof(last_topic_jp) - 1] = '\0';
+      
+      if (cmd->romaji != NULL && cmd->romaji[0] != '\0') {
+        strncpy(last_topic_romaji, cmd->romaji, sizeof(last_topic_romaji) - 1);
+      } else {
+        strncpy(last_topic_romaji, "sore", sizeof(last_topic_romaji) - 1);
+      }
+      last_topic_romaji[sizeof(last_topic_romaji) - 1] = '\0';
+    } else if (isQuitRule) {
+      last_topic_jp[0] = '\0';
+      last_topic_romaji[0] = '\0';
+    }
+
+    char bodyJp[256] = "";
+    char bodyRomaji[256] = "";
+
+    replacePlaceholder(selected.jp, cmd->reflected_jp, bodyJp, sizeof(bodyJp));
+    replacePlaceholder(selected.romaji, cmd->romaji, bodyRomaji, sizeof(bodyRomaji));
+
+    if (!isQuitRule) { 
+      int fillerIdx = rand() % FILLER_COUNT;
+      snprintf(outDisplay, maxLen, "%s%s", FILLER_PREFIXES[fillerIdx].jp, bodyJp);
+      snprintf(outRomaji, maxLen, "%s%s", FILLER_PREFIXES[fillerIdx].romaji, bodyRomaji);
+    } else {
+      strncpy(outDisplay, bodyJp, maxLen - 1);
+      strncpy(outRomaji, bodyRomaji, maxLen - 1);
+    }
+    return;
+  }
+
+  // マッチしなかった場合のフォールバック処理
+  if (last_topic_jp[0] != '\0') {
+    const char* safeRomaji = (last_topic_romaji[0] != '\0') ? last_topic_romaji : "sore";
+    snprintf(outDisplay, maxLen, "先ほどお話しされた「%s」のことについて、もう少し詳しく教えていただけますか？", last_topic_jp);
+    snprintf(outRomaji, maxLen, "saki'hodo ohanashi sara'ta %s no koto'ni tsu'ite, mo'u sukoshi' kuwashi'ku oshi'ete itadakema'suka?", safeRomaji);
+    last_topic_jp[0] = '\0';
+    last_topic_romaji[0] = '\0';
+    return;
+  }
+
+  strncpy(outDisplay, "もう少し詳しく教えていただけますか？", maxLen - 1);
+  strncpy(outRomaji, "mo'u sukoshi' kuwashi'ku oshi'ete itadakema'suka?", maxLen - 1);
+}
+/* OLD version
+void analyze(const IntegratedAsrCommand* cmd, char* outDisplay, char* outRomaji, size_t maxLen) {
+  const char* statement = cmd->raw_jp;
+
+  const char* clearKeys[] = {"そんな話", "言っていない", "違う話", "何言ってる", "何言ってんだ", "わけがわからない", "意味がわからない"};
+  for (size_t i = 0; i < 7; i++) {
+    if (strstr(statement, clearKeys[i]) != NULL) {
+      last_topic_jp[0] = '\0';
+      last_topic_romaji[0] = '\0';
+      break;
+    }
+  }
+
+  for (size_t i = 0; i < RULE_COUNT; i++) {
+    bool matched = false;
+    for (size_t k = 0; k < 8 && PSYCHOBABBLE[i].keywords[k] != NULL; k++) {
+      if (strstr(statement, PSYCHOBABBLE[i].keywords[k]) != NULL) {
+        matched = true;
+        break;
+      }
+    }
+
+    if (matched) {
+      int resIdx = rand() % PSYCHOBABBLE[i].response_count;
+      ResponsePair selected = PSYCHOBABBLE[i].responses[resIdx];
+
+      if (i != 7 && cmd->reflected_jp[0] != '\0') {
+        strncpy(last_topic_jp, cmd->reflected_jp, sizeof(last_topic_jp) - 1);
+        last_topic_jp[sizeof(last_topic_jp) - 1] = '\0';
+        
+        if (cmd->romaji != NULL && cmd->romaji[0] != '\0') {
+          strncpy(last_topic_romaji, cmd->romaji, sizeof(last_topic_romaji) - 1);
+        } else {
+          strncpy(last_topic_romaji, "sore", sizeof(last_topic_romaji) - 1);
+        }
+        last_topic_romaji[sizeof(last_topic_romaji) - 1] = '\0';
+      } else if (i == 7) {
+        last_topic_jp[0] = '\0';
+        last_topic_romaji[0] = '\0';
+      }
+
+      char bodyJp[256] = "";
+      char bodyRomaji[256] = "";
+
+      replacePlaceholder(selected.jp, cmd->reflected_jp, bodyJp, sizeof(bodyJp));
+      replacePlaceholder(selected.romaji, cmd->romaji, bodyRomaji, sizeof(bodyRomaji));
+
+      if (i != 7) { 
+        int fillerIdx = rand() % FILLER_COUNT;
+        snprintf(outDisplay, maxLen, "%s%s", FILLER_PREFIXES[fillerIdx].jp, bodyJp);
+        snprintf(outRomaji, maxLen, "%s%s", FILLER_PREFIXES[fillerIdx].romaji, bodyRomaji);
+      } else {
+        strncpy(outDisplay, bodyJp, maxLen - 1);
+        strncpy(outRomaji, bodyRomaji, maxLen - 1);
+      }
+      return;
+    }
+  }
+
+  if (last_topic_jp[0] != '\0') {
+    const char* safeRomaji = (last_topic_romaji[0] != '\0') ? last_topic_romaji : "sore";
+    snprintf(outDisplay, maxLen, "先ほどお話しされた「%s」のことについて、もう少し詳しく教えていただけますか？", last_topic_jp);
+    snprintf(outRomaji, maxLen, "saki'hodo ohanashi sara'ta %s no koto'ni tsu'ite, mo'u sukoshi' kuwashi'ku oshi'ete itadakema'suka?", safeRomaji);
+    last_topic_jp[0] = '\0';
+    last_topic_romaji[0] = '\0';
+    return;
+  } 
+
+  strncpy(outDisplay, "もう少し詳しく教えていただけますか？", maxLen - 1);
+  strncpy(outRomaji, "mo'u sukoshi' kuwashi'ku oshi'ete itadakema'suka?", maxLen - 1);
+} */
+
+void printSerial(const char* tag, const char* msg) {
+  if (ENABLE_SERIAL_OUT) {
+    Serial.print(tag);
+    Serial.println(msg);
+  }
+}
+
+// ==========================================
+// --- AquesTalk Pico 音声出力 ---
+// ==========================================
+void speakKoe(const char* koe) {
+  if (M5.Speaker.isPlaying()) {
+    M5.Speaker.stop();
+  }
+
+  // 話速: 90
+  uint8_t err = CAqTkPicoF_SetKoe((const uint8_t*)koe, 90, 0xffffU);
+  if (err != 0) {
+    Serial.printf("[エラー] CAqTkPicoF_SetKoe 失敗: %d\n", err);
+    return;
+  }
+
+  short rawFrame[FRAME_LEN];
+  uint16_t outLen = 0;
+  int frameCount = 0;
+
+  while (true) {
+    uint8_t res = CAqTkPicoF_SyntheFrame(rawFrame, &outLen);
+    if (outLen > 0) {
+      avatar.setMouthOpenRatio((frameCount++ % 2 == 0) ? 0.7f : 0.2f);
+      
+      while (M5.Speaker.isPlaying(1) >= 2) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+      }
+      M5.Speaker.playRaw(rawFrame, outLen, 8000, false, 1, 1);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (res != 0) break;
+  }
+  avatar.setMouthOpenRatio(0.0f);
+} 
+void speakAquesTalk(const char* romajiText) {
+  printSerial("[AquesTalk Target]: ", romajiText);
+
+  clearUARTBuffer();
+  speakKoe(romajiText); 
+  ignoreAsrUntil = millis() + 1000;
+  clearUARTBuffer();
+}
+
+// ==========================================
+// --- プロトタイプ宣言 ---
+// ==========================================
+void initServos();
+void setServoDuty(int pin, int duty);
+void disableServos();
+void audioTask(void *pvParameters);
+void servoAvatarTask(void *pvParameters);
+void playBeep(int freq, int duration);
+void scanSDCard();
+void playRandomMusic();
+void stopMusic();
+void checkIMU();
+void performBow();
+void performLookAround();
+void checkRandomIdleAction();
+void handleASRInput(int cmdId);
+void checkConversationTimeout();
+
+// ==========================================
+// --- ASR バイナリパケット解析器 ---
+// フォーマット: [0xAA] [0x55] [ID] [0x55] [0xAA]
+// ==========================================
+bool readASRPacket(int &outCmdId) {
+  static uint8_t pktBuf[5];
+
+  while (SerialPortC.available() > 0) {
+    uint8_t b = SerialPortC.read();
+    // ★★★ここを追加：受信した生のデータを16進数でシリアルモニタに出力★★★
+    Serial.printf("[%02X] ", b);
+
+    if (asrPktIdx == 0) { 
+      if (b == 0xAA) {
+        pktBuf[0] = b;
+        asrPktIdx = 1; 
+      }
+      continue;
+    }
+
+    if (asrPktIdx == 1) { 
+      if (b == 0x55) {
+        pktBuf[1] = b;
+        asrPktIdx = 2; 
+      } else if (b == 0xAA) {
+        asrPktIdx = 1; 
+      } else {
+        asrPktIdx = 0; 
+      }
+      continue;
+    }
+
+    if (asrPktIdx == 2) { 
+      pktBuf[2] = b;
+      asrPktIdx = 3; 
+      continue;
+    }
+
+    if (asrPktIdx == 3) { 
+      if (b == 0x55) {
+        pktBuf[3] = b;
+        asrPktIdx = 4; 
+      } else {
+        asrPktIdx = 0; 
+      }
+      continue;
+    }
+
+    if (asrPktIdx == 4) { 
+      if (b == 0xAA) {
+        pktBuf[4] = b;
+        outCmdId = pktBuf[2]; 
+        asrPktIdx = 0;        
+        return true;          
+      } else {
+        asrPktIdx = 0; 
+      }
+    }
+  }
+
+  return false; 
+}
+
+// ==========================================
+// --- Setup & Loop ---
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(3000); // ★追加：PCがUSB（COMポート）を認識し、シリアルモニタが開くのを待つ
+  // Wi-Fi機能を明示的に完全停止（RFノイズと電源リップルの抑制）
+  WiFi.mode(WIFI_OFF);
+  btStop(); // ★Bluetoothを完全停止
+
+  auto cfg = M5.config();
+  
+  cfg.internal_spk = true;
+  cfg.internal_mic = true;
+
+  auto spk_cfg = M5.Speaker.config();
+  spk_cfg.sample_rate = 44100;
+  spk_cfg.task_priority = 3;
+  M5.Speaker.config(spk_cfg);
+  // --- ここを追加：USBシリアルがPCに認識されるのを待つ ---
+
+  M5.begin(cfg);
+  M5.Speaker.begin();
+  M5.Speaker.setVolume(currentVolume);
+
+  M5.Imu.begin();
+  SerialPortC.begin(115200, SERIAL_8N1, PORT_C_RX, PORT_C_TX);
+
+  if (!SD.begin(GPIO_NUM_4, SPI, 15000000)) { 
+    Serial.println("SD Card Mount Failed");
+  } 
+
+  initServos();
+  avatar.init();
+  scanSDCard();
+
+  uint8_t res = CAqTkPicoF_Init(picoWorkBuf, FRAME_LEN, NULL);
+  if (res != 0) {
+    Serial.printf("[エラー] CAqTkPicoF_Init 失敗: %d\n", res);
+  } else {
+    Serial.println("[OK] AquesTalk Pico 初期化成功");
+  }
+
+  xTaskCreatePinnedToCore(audioTask, "audioTask", 8192, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(servoAvatarTask, "servoAvatarTask", 4096, NULL, 0, NULL, 1);
+
+  nextRandomActionTime = millis() + random(8000, 12000);
+
+  // ★修正箇所：発話とモーションが【終わった後】にタイマーをセットする
+  avatar.setSpeechText("Hello!");
+  speakAquesTalk("ko'nnichiwa");
+  performBow();
+  speechTextTimeout = millis() + 2000;
+}
+
+void loop() {
+  M5.update();
+
+  int receivedCmdId = -1;
+  if (readASRPacket(receivedCmdId)) {
+    if (currentRobotMode != MODE_IDLE || currentConvState == CONV_TALK || millis() < ignoreAsrUntil) {
+      clearUARTBuffer();
+    } else {
+      handleASRInput(receivedCmdId);
+    }
+  }
+
+  checkConversationTimeout();
+
+  if (speechTextTimeout > 0 && millis() > speechTextTimeout) {
+    avatar.setSpeechText("");
+    speechTextTimeout = 0;
+  }
+
+  if (requestPlayNext) {
+    requestPlayNext = false;
+    if (currentRobotMode == MODE_PLAYBACK) {
+      playRandomMusic();
+    }
+  }
+
+  if (M5.Touch.getCount() > 0) {
+    auto detail = M5.Touch.getDetail(0);
+    
+    if (detail.wasPressed()) {
+      int x = detail.x;
+      int y = detail.y;
+
+      if (y < 120) {
+        if (x < 160) {
+          currentVolume = (uint8_t)max(0, currentVolume - 25);
+          avatar.setSpeechText("vol down");
+        } else {
+          currentVolume = (uint8_t)min(255, currentVolume + 25);
+          avatar.setSpeechText("vol up");
+        }
+        M5.Speaker.setVolume(currentVolume);
+        M5.Speaker.setAllChannelVolume(currentVolume);
+        speechTextTimeout = millis() + 1500;
+      } 
+      else {
+        if (x < 106) {
+          if (currentRobotMode != MODE_PLAYBACK) {
+            currentRobotMode = MODE_PLAYBACK;
+            currentConvState = CONV_LISTEN_WAIT;
+            avatar.setSpeechText("Play Music");
+            playRandomMusic();
+            speechTextTimeout = millis() + 2000; // ★修正
+          }
+        } 
+        else if (x >= 106 && x < 213) {
+          if (currentRobotMode == MODE_PLAYBACK) stopMusic();
+          avatar.setSpeechText("stop");
+          clearUARTBuffer();
+          
+          currentRobotMode = MODE_IDLE;
+          currentConvState = CONV_LISTEN_WAIT;
+          
+          performBow();
+          
+          speechTextTimeout = millis() + 2000; // ★修正
+          nextRandomActionTime = millis() + random(8000, 15000);
+          clearUARTBuffer();
+        } 
+        else {
+          if (currentRobotMode == MODE_PLAYBACK) stopMusic();
+          avatar.setSpeechText("Idle Mode");
+          clearUARTBuffer();
+          
+          currentRobotMode = MODE_IDLE;
+          currentConvState = CONV_LISTEN_WAIT;
+          
+          performBow();
+          
+          speechTextTimeout = millis() + 2000; // ★修正
+          nextRandomActionTime = millis() + random(8000, 15000);
+          clearUARTBuffer();
+        }
+      }
+    }
+  }
+
+  if (currentRobotMode == MODE_IDLE) {
+    checkIMU();
+    if (currentConvState != CONV_TALK) {
+      checkRandomIdleAction();
+    }
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+// ==========================================
+// --- ASR ＆ 会話処理 ---
+// ==========================================
+void handleASRInput(int cmdId) {
+  const IntegratedAsrCommand* cmd = getAsrCommand(cmdId);
+  if (cmd == nullptr) return;
+  if (currentRobotMode != MODE_IDLE) return;
+
+  printSerial("[ASR Cmd Received]: ", cmd->raw_jp);
+
+  if (cmdId == 0 || cmdId== 99) {
+    currentConvState = CONV_LISTEN_ACTIVE;
+    lastVoiceInputTime = millis();
+    avatar.setSpeechText("((( ACTIVE )))");
+    speakAquesTalk("ko'nnichiwa");
+    
+    // ★修正箇所：発話完了後にタイマーをセット
+    speechTextTimeout = millis() + 2000; 
+    lastVoiceInputTime = millis();
+    return;
+  }
+
+  lastVoiceInputTime = millis();
+  currentConvState = CONV_TALK;
+
+  char displayRes[256];
+  char romajiRes[256];
+  
+  analyze(cmd, displayRes, romajiRes, sizeof(displayRes));
+
+  printSerial("[ELIZA Display]: ", displayRes);
+  speakAquesTalk(romajiRes);
+
+  lastVoiceInputTime = millis();
+
+  if ((cmdId >= 37 && cmdId <= 42) || strstr(cmd->raw_jp, "終了") != NULL || strstr(cmd->raw_jp, "さようなら") != NULL || strstr(cmd->raw_jp, "バイバイ") != NULL) {
+    currentConvState = CONV_LISTEN_WAIT;
+    avatar.setSpeechText("Idle Mode");
+    speechTextTimeout = millis() + 2000;
+    nextRandomActionTime = millis() + random(8000, 15000);
+    clearUARTBuffer();
+  } else {
+    currentConvState = CONV_LISTEN_ACTIVE;
+  }
+}
+
+void checkConversationTimeout() {
+  if (currentRobotMode == MODE_IDLE && currentConvState == CONV_LISTEN_ACTIVE) {
+    if (millis() - lastVoiceInputTime > SILENCE_TIMEOUT) {
+      currentConvState = CONV_LISTEN_WAIT;
+      avatar.setSpeechText("Idle Mode");
+      speechTextTimeout = millis() + 2000;
+      nextRandomActionTime = millis() + random(8000, 15000);
+      clearUARTBuffer();
+      printSerial("[ELIZA]: ", "10s Timeout -> Returned to CONV_LISTEN_WAIT (Buffer Cleared)");
+    }
+  }
+}
+
+// ==========================================
+// --- モーション ＆ アイドル動作 ---
+// ==========================================
+void checkRandomIdleAction() {
+  if (millis() > nextRandomActionTime) {
+    int act = random(0, 2);
+    if (act == 0) performBow();
+    else performLookAround();
+    nextRandomActionTime = millis() + random(8000, 16000);
+  }
+}
+
+void performBow() {
+  RobotMode previousMode = currentRobotMode;
+  currentRobotMode = MODE_ACTION; 
+
+  clearUARTBuffer();
+
+  setServoDuty(PIN_SERVO_PAN, PAN_CENTER);
+  for (int duty = TILT_CENTER; duty >= TILT_MIN; duty--) {
+    setServoDuty(PIN_SERVO_TILT, duty);
+    vTaskDelay(pdMS_TO_TICKS(30));
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  for (int duty = TILT_MIN; duty <= TILT_CENTER; duty++) {
+    setServoDuty(PIN_SERVO_TILT, duty);
+    vTaskDelay(pdMS_TO_TICKS(25));
+  }
+
+  clearUARTBuffer();
+  currentRobotMode = previousMode; 
+}
+
+void performLookAround() {
+  RobotMode previousMode = currentRobotMode;
+  currentRobotMode = MODE_ACTION;
+
+  clearUARTBuffer();
+
+  for (int duty = PAN_CENTER; duty <= PAN_MAX - 10; duty++) {
+    setServoDuty(PIN_SERVO_PAN, duty);
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  for (int duty = PAN_MAX - 10; duty >= PAN_MIN + 10; duty--) {
+    setServoDuty(PIN_SERVO_PAN, duty);
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  for (int duty = PAN_MIN + 10; duty <= PAN_CENTER; duty++) {
+    setServoDuty(PIN_SERVO_PAN, duty);
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  clearUARTBuffer();
+  currentRobotMode = previousMode;
+}
+
+// ==========================================
+// --- サーボ制御 ---
+// ==========================================
+void initServos() {
+  ledcAttach(PIN_SERVO_PAN, 50, 10); 
+  ledcAttach(PIN_SERVO_TILT, 50, 10);
+
+  lastDutyPan = -1;
+  lastDutyTilt = -1;
+  setServoDuty(PIN_SERVO_PAN, PAN_CENTER);
+  setServoDuty(PIN_SERVO_TILT, TILT_CENTER);
+}
+
+void setServoDuty(int pin, int duty) {
+  if (currentRobotMode == MODE_PLAYBACK) return;
+
+  if (pin == PIN_SERVO_PAN) {
+    if (duty < PAN_MIN) duty = PAN_MIN;
+    if (duty > PAN_MAX) duty = PAN_MAX;
+  } else if (pin == PIN_SERVO_TILT) {
+    if (duty < TILT_MIN) duty = TILT_MIN;
+    if (duty > TILT_MAX) duty = TILT_MAX;
+  }
+
+  if (pin == PIN_SERVO_PAN) {
+    if (duty != lastDutyPan) {
+      ledcAttach(pin, 50, 10);
+      ledcWrite(pin, duty);
+      lastDutyPan = duty;
+    }
+  } else if (pin == PIN_SERVO_TILT) {
+    if (duty != lastDutyTilt) {
+      ledcAttach(pin, 50, 10);
+      ledcWrite(pin, duty);
+      lastDutyTilt = duty;
+    }
+  }
+}
+
+void disableServos() {
+  ledcDetach(PIN_SERVO_PAN);
+  ledcDetach(PIN_SERVO_TILT);
+  lastDutyPan = -1;
+  lastDutyTilt = -1;
+}
+
+// ==========================================
+// --- 音楽再生 & SDカード機能 ---
+// ==========================================
+void playBeep(int freq, int duration) {
+  if (!ENABLE_BEEP_SOUND) return;
+
+  M5.Speaker.setVolume(currentVolume);
+  M5.Speaker.tone(freq, duration);
+  vTaskDelay(pdMS_TO_TICKS(duration + 20));
+}
+
+void scanSDCard() {
+  musicFiles.clear();
+  File root = SD.open("/");
+  if (!root) return;
+
+  File file = root.openNextFile();
+  while (file) {
+    if (!file.isDirectory()) {
+      String name = String(file.name());
+      if (name.endsWith(".mp3") || name.endsWith(".MP3") || name.endsWith(".wav") || name.endsWith(".WAV")) {
+        musicFiles.push_back("/" + name);
+      }
+    }
+    file = root.openNextFile();
+  }
+  root.close();
+}
+
+void playRandomMusic() {
+  if (musicFiles.empty()) {
+    playBeep(2000, 100); 
+    avatar.setSpeechText("No music. Sorry");
+    speechTextTimeout = millis() + 2000;
+    currentRobotMode = MODE_IDLE;
+    return;
+  }
+
+  stopMusic();
+
+  int index = random(0, musicFiles.size());
+  String targetFile = musicFiles[index];
+
+  M5.Speaker.setVolume(currentVolume);
+  M5.Speaker.setAllChannelVolume(currentVolume);
+
+  audioFile = new AudioFileSourceSD(targetFile.c_str());
+  audioOut  = new AudioOutputM5Speaker(&M5.Speaker, 0);
+
+  if (targetFile.endsWith(".wav") || targetFile.endsWith(".WAV")) {
+    audioGen = new AudioGeneratorWAV();
+  } else {
+    audioGen = new AudioGeneratorMP3();
+  }
+
+  if (audioGen->begin(audioFile, audioOut)) {
+    isPlaying = true;
+    currentRobotMode = MODE_PLAYBACK;
+    disableServos();
+    clearUARTBuffer();
+    Serial.println("Audio Playing: " + targetFile);
+  } else {
+    Serial.println("Error: Failed to play Audio");
+    avatar.setSpeechText("Play Error");
+    speechTextTimeout = millis() + 2000;
+    stopMusic();
+  }
+}
+
+void stopMusic() {
+  isPlaying = false;
+
+  if (audioGen) {
+    audioGen->stop();
+    delete audioGen;
+    audioGen = nullptr;
+  }
+  if (audioFile) {
+    delete audioFile;
+    audioFile = nullptr;
+  }
+  if (audioOut) {
+    delete audioOut;
+    audioOut = nullptr;
+  }
+}
+
+void checkIMU() {
+  if (!M5.Imu.isEnabled()) return;
+
+  static uint32_t lastCheck = 0;
+  if (millis() - lastCheck < 200) return;
+  lastCheck = millis();
+
+  float ax, ay, az;
+  M5.Imu.getAccel(&ax, &ay, &az);
+
+  float totalAccel = sqrt(ax*ax + ay*ay + az*az);
+  if (totalAccel > 1.5) { 
+    if (ENABLE_BEEP_SOUND) {
+      playBeep(1500, 150);
+    } 
+    avatar.setSpeechText("Hello!");
+    performBow();
+    speechTextTimeout = millis() + 2000; // ★修正
+    nextRandomActionTime = millis() + random(8000, 16000);
+  }
+}
+
+// ==========================================
+// --- FreeRTOS タスク ---
+// ==========================================
+void audioTask(void *pvParameters) {
+  while (1) {
+    if (isPlaying && audioGen && audioGen->isRunning()) {
+      if (!audioGen->loop()) {
+        stopMusic();
+        requestPlayNext = true;
+      }
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+void servoAvatarTask(void *pvParameters) {
+  int motionTick = 0;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  while (1) {
+    motionTick++;
+
+    if (currentRobotMode == MODE_PLAYBACK) {
+      avatar.setMouthOpenRatio(0.0); 
+    } 
+    else if (currentRobotMode == MODE_IDLE) {
+      if (currentConvState != CONV_TALK) {
+        if (motionTick % 10 == 0) {
+          if (random(0, 10) > 4) {
+            idleMouthRatio = (float)random(20, 80) / 100.0f;
+          } else {
+            idleMouthRatio = 0.0f;
+          }
+        }
+        avatar.setMouthOpenRatio(idleMouthRatio);
+      }
+
+      if (currentConvState == CONV_TALK) {
+        setServoDuty(PIN_SERVO_PAN, PAN_CENTER);
+        setServoDuty(PIN_SERVO_TILT, TILT_CENTER);
+      } else {
+        int targetPan  = PAN_CENTER + (int)(15.0 * sin(motionTick * 0.05));
+        setServoDuty(PIN_SERVO_PAN, targetPan);
+        setServoDuty(PIN_SERVO_TILT, TILT_CENTER);
+      }
+    }
+    
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(33));
+  }
+}
